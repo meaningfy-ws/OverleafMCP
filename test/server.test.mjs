@@ -23,9 +23,9 @@ function fixture(extra = {}) {
 }
 
 // Spawn the server, run initialize + one tools/call, return { result, stderr }.
-function callTool(env, name, args = {}) {
+function callTool(env, name, args = {}, nodeArgs = []) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [SERVER], {
+    const child = spawn(process.execPath, [...nodeArgs, SERVER], {
       env: { PATH: process.env.PATH, HOME: process.env.HOME, ...env },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -92,3 +92,99 @@ test('list_projects lists configured keys', async () => {
   const { result } = await callTool({ OVERLEAF_PROJECTS_CONFIG: file }, 'list_projects');
   assert.deepEqual(JSON.parse(text(result)).map((p) => p.id), ['paper']);
 });
+
+test('list_overleaf_projects without a cookie explains how to add one', async () => {
+  const { file } = fixture();
+  const { result } = await callTool({ OVERLEAF_PROJECTS_CONFIG: file }, 'list_overleaf_projects');
+  assert.equal(result.isError, true);
+  assert.match(text(result), /No Overleaf session cookie configured.*OVERLEAF_SESSION_COOKIE/s);
+});
+
+test('an invalid cookie reports expiry and never echoes the cookie', { skip: process.env.OFFLINE === '1' }, async () => {
+  const secret = 'bogus-secret-xyz';
+  const { file } = fixture({ sessionCookie: `overleaf_session2=${secret}` });
+  const { result, stderr } = await callTool({ OVERLEAF_PROJECTS_CONFIG: file }, 'list_overleaf_projects', { sync: true });
+  assert.equal(result.isError, true);
+  assert.match(text(result), /Overleaf session cookie expired — copy a fresh overleaf_session2 from your browser/);
+  assert.doesNotMatch(text(result) + stderr, new RegExp(secret));
+});
+
+test('sync adds only missing projects, renames ID placeholders, keeps file mode 600', async () => {
+  const placeholder = 'bbbbbbbbbbbbbbbbbbbbbbbb';
+  const { file } = fixture({ sessionCookie: 'stub' });
+  const cfg = JSON.parse(readFileSync(file, 'utf8'));
+  cfg.projects.paper.name = 'My own name';
+  cfg.projects[placeholder] = { name: placeholder, projectId: placeholder, gitToken: 'olp_fake' };
+  writeFileSync(file, JSON.stringify(cfg, null, 2) + '\n', { mode: 0o600 });
+  const remote = [
+    { _id: 'aaaaaaaaaaaaaaaaaaaaaaaa', name: 'Remote name', accessLevel: 'owner' },
+    { _id: placeholder, name: 'Real B', accessLevel: 'readAndWrite' },
+    { _id: 'cccccccccccccccccccccccc', name: 'New C', accessLevel: 'owner' },
+  ];
+  const stub = path.join(path.dirname(SERVER), 'test', 'fetch-stub.mjs');
+  const { result } = await callTool(
+    { OVERLEAF_PROJECTS_CONFIG: file, STUB_PROJECTS: JSON.stringify(remote) },
+    'list_overleaf_projects', { sync: true }, ['--import', stub]
+  );
+  assert.equal(result.isError, undefined, text(result));
+  const out = JSON.parse(text(result));
+  assert.deepEqual([out.added, out.renamed], [1, 1]);
+  assert.deepEqual(out.projects.map((p) => p.configuredAs), ['paper', placeholder, 'cccccccccccccccccccccccc']);
+  const saved = JSON.parse(readFileSync(file, 'utf8'));
+  assert.equal(saved.projects.paper.name, 'My own name');
+  assert.equal(saved.projects[placeholder].name, 'Real B');
+  assert.deepEqual(saved.projects.cccccccccccccccccccccccc, { name: 'New C', projectId: 'cccccccccccccccccccccccc', gitToken: 'olp_fake' });
+  assert.equal(saved.sessionCookie, 'stub');
+  assert.equal(statSync(file).mode & 0o777, 0o600);
+});
+
+const STUB = path.join(path.dirname(SERVER), 'test', 'fetch-stub.mjs');
+const REMOTE = [
+  { _id: 'aaaaaaaaaaaaaaaaaaaaaaaa', name: 'Paper', accessLevel: 'owner' },
+  { _id: 'cccccccccccccccccccccccc', name: 'Shared C', accessLevel: 'readWrite' },
+];
+
+test('listing without sync reads the cookie file, reports configuredAs, writes nothing', async () => {
+  const { dir, file } = fixture();
+  const cookieFile = path.join(dir, 'cookie');
+  const seen = path.join(dir, 'seen');
+  writeFileSync(cookieFile, 'overleaf_session2=s3cret\n', { mode: 0o600 });
+  const before = readFileSync(file, 'utf8');
+  const { result, stderr } = await callTool(
+    { OVERLEAF_PROJECTS_CONFIG: file, OVERLEAF_SESSION_COOKIE_FILE: cookieFile, STUB_PROJECTS: JSON.stringify(REMOTE), STUB_SEEN: seen },
+    'list_overleaf_projects', {}, ['--import', STUB]
+  );
+  assert.equal(result.isError, undefined, text(result));
+  assert.equal(readFileSync(seen, 'utf8'), 'overleaf_session2=s3cret'); // prefix and newline stripped, not doubled
+  assert.deepEqual(JSON.parse(text(result)), {
+    projects: [
+      { projectId: 'aaaaaaaaaaaaaaaaaaaaaaaa', name: 'Paper', accessLevel: 'owner', configuredAs: 'paper' },
+      { projectId: 'cccccccccccccccccccccccc', name: 'Shared C', accessLevel: 'readWrite', configuredAs: null },
+    ],
+  });
+  assert.equal(readFileSync(file, 'utf8'), before);
+  assert.doesNotMatch(text(result) + stderr, /s3cret/);
+});
+
+test('a second sync is a no-op and leaves the file byte-identical', async () => {
+  const { file } = fixture({ sessionCookie: 'stub' });
+  const env = { OVERLEAF_PROJECTS_CONFIG: file, STUB_PROJECTS: JSON.stringify(REMOTE) };
+  await callTool(env, 'list_overleaf_projects', { sync: true }, ['--import', STUB]);
+  const after1 = readFileSync(file, 'utf8');
+  const { result } = await callTool(env, 'list_overleaf_projects', { sync: true }, ['--import', STUB]);
+  const out = JSON.parse(text(result));
+  assert.deepEqual([out.added, out.renamed], [0, 0]);
+  assert.equal(readFileSync(file, 'utf8'), after1);
+});
+
+for (const [label, stubEnv] of [['a redirect to /login', { STUB_STATUS: '302' }], ['an HTML page', { STUB_HTML: '1' }]]) {
+  test(`${label} is reported as an expired cookie and nothing is written`, async () => {
+    const { file } = fixture({ sessionCookie: 'stale-cookie-123' });
+    const before = readFileSync(file, 'utf8');
+    const { result, stderr } = await callTool({ OVERLEAF_PROJECTS_CONFIG: file, ...stubEnv }, 'list_overleaf_projects', { sync: true }, ['--import', STUB]);
+    assert.equal(result.isError, true);
+    assert.match(text(result), /Overleaf session cookie expired/);
+    assert.doesNotMatch(text(result) + stderr, /stale-cookie-123/);
+    assert.equal(readFileSync(file, 'utf8'), before);
+  });
+}
